@@ -42,7 +42,6 @@ class DownloadResponse(BaseModel):
 
 
 def get_save_path(platform: str) -> str:
-    """Organize by platform/date"""
     date_str = datetime.now().strftime("%Y-%m-%d")
     folder = os.path.join(DOWNLOAD_BASE, platform, date_str)
     Path(folder).mkdir(parents=True, exist_ok=True)
@@ -56,7 +55,6 @@ async def download_video(req: DownloadRequest):
     save_folder = get_save_path(req.platform)
     output_template = os.path.join(save_folder, "%(title)s.%(ext)s")
 
-    # Build yt-dlp command
     cmd = [
         "yt-dlp",
         "--no-playlist",
@@ -65,18 +63,29 @@ async def download_video(req: DownloadRequest):
         "--output", output_template,
         "--print", "after_move:filepath",
         "--no-warnings",
-        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "--restrict-filenames",
+        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "--add-header", "Accept-Language:en-US,en;q=0.9",
     ]
 
-    # Platform-specific options
+    # === PLATFORM LOGIC ===
     if req.platform == "twitter":
-        cmd += ["--extractor-args", "twitter:api=graphql"]
+        cmd += [
+            "-f", "bv*+ba/b",
+            "--extractor-args", "twitter:api=graphql"
+        ]
+
     elif req.platform == "youtube":
         cmd += [
-            "-f", "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-            "--extractor-args", "youtube:player_client=web,mweb",
+            # ✅ Flexible format selection (fixes Shorts issue)
+            "-f", "bv*+ba/b",
+            # ✅ Better compatibility for Shorts & restricted videos
+            "--extractor-args", "youtube:player_client=android,web"
         ]
+
+    else:
+        # fallback for unknown platforms
+        cmd += ["-f", "bv*+ba/b"]
 
     cmd.append(req.url)
 
@@ -85,29 +94,32 @@ async def download_video(req: DownloadRequest):
             cmd,
             capture_output=True,
             text=True,
-            timeout=90
+            timeout=120
         )
 
         if result.returncode != 0:
             error_msg = result.stderr.strip() or "Unknown yt-dlp error"
             logger.error(f"yt-dlp failed: {error_msg}")
+
             return DownloadResponse(
                 success=False,
                 error=error_msg,
-                chatId=str(req.chatId),
+                chatId=req.chatId,
                 url=req.url,
                 platform=req.platform,
                 deliveryMode=req.deliveryMode
             )
 
-        # Get file path from stdout
-        file_path = result.stdout.strip().split("\n")[-1]
+        # Extract file path
+        stdout_lines = result.stdout.strip().split("\n")
+        file_path = stdout_lines[-1] if stdout_lines else None
 
-        if not os.path.exists(file_path):
+        if not file_path or not os.path.exists(file_path):
+            logger.error("File not found after download")
             return DownloadResponse(
                 success=False,
                 error="File not found after download",
-                chatId=str(req.chatId),
+                chatId=req.chatId,
                 url=req.url,
                 platform=req.platform,
                 deliveryMode=req.deliveryMode
@@ -125,30 +137,37 @@ async def download_video(req: DownloadRequest):
             fileName=file_name,
             fileSize=file_size,
             deliveryMode=req.deliveryMode,
-            chatId=str(req.chatId),
+            chatId=req.chatId,
             url=req.url,
             platform=req.platform
         )
 
     except subprocess.TimeoutExpired:
+        logger.error("Download timed out")
         return DownloadResponse(
             success=False,
-            error="Download timed out (90s limit exceeded)",
-            chatId=str(req.chatId),
+            error="Download timed out (120s limit exceeded)",
+            chatId=req.chatId,
             url=req.url,
             platform=req.platform,
             deliveryMode=req.deliveryMode
         )
+
     except Exception as e:
         logger.exception("Unexpected error")
         return DownloadResponse(
             success=False,
             error=str(e),
-            chatId=str(req.chatId),
+            chatId=req.chatId,
             url=req.url,
             platform=req.platform,
             deliveryMode=req.deliveryMode
         )
+
+
+@app.get("/")
+async def root():
+    return {"message": "yt-dlp API is running"}
 
 
 @app.get("/health")
