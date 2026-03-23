@@ -13,10 +13,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # === CONFIG ===
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_BASE = os.getenv("DOWNLOAD_BASE", "/downloads")
-MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))  # Telegram limit
+MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
+
+COOKIES_PATH = os.path.join(BASE_DIR, "cookies.txt")
 
 
+# === MODELS ===
 class DownloadRequest(BaseModel):
     url: str
     platform: str
@@ -41,6 +45,7 @@ class DownloadResponse(BaseModel):
     platform: str = None
 
 
+# === HELPERS ===
 def get_save_path(platform: str) -> str:
     date_str = datetime.now().strftime("%Y-%m-%d")
     folder = os.path.join(DOWNLOAD_BASE, platform, date_str)
@@ -48,9 +53,20 @@ def get_save_path(platform: str) -> str:
     return folder
 
 
+def normalize_youtube_url(url: str) -> str:
+    if "youtube.com/shorts/" in url:
+        video_id = url.split("/shorts/")[1].split("?")[0]
+        return f"https://www.youtube.com/watch?v={video_id}"
+    return url
+
+
+# === ROUTES ===
 @app.post("/download", response_model=DownloadResponse)
 async def download_video(req: DownloadRequest):
     logger.info(f"Download request: {req.url} | platform={req.platform} | mode={req.deliveryMode}")
+
+    # Normalize URL
+    req.url = normalize_youtube_url(req.url)
 
     save_folder = get_save_path(req.platform)
     output_template = os.path.join(save_folder, "%(title)s.%(ext)s")
@@ -69,22 +85,22 @@ async def download_video(req: DownloadRequest):
     ]
 
     # === PLATFORM LOGIC ===
-    if req.platform == "twitter":
+    if req.platform == "youtube":
+        logger.info(f"Using cookies: {COOKIES_PATH} | Exists: {os.path.exists(COOKIES_PATH)}")
+
+        cmd += [
+            "-f", "bv*+ba/b",
+            "--cookies", COOKIES_PATH,
+            "--extractor-args", "youtube:player_client=android,web"
+        ]
+
+    elif req.platform == "twitter":
         cmd += [
             "-f", "bv*+ba/b",
             "--extractor-args", "twitter:api=graphql"
         ]
 
-    elif req.platform == "youtube":
-        cmd += [
-            # ✅ Flexible format selection (fixes Shorts issue)
-            "-f", "bv*+ba/b",
-            # ✅ Better compatibility for Shorts & restricted videos
-            "--extractor-args", "youtube:player_client=android,web"
-        ]
-
     else:
-        # fallback for unknown platforms
         cmd += ["-f", "bv*+ba/b"]
 
     cmd.append(req.url)
@@ -116,6 +132,7 @@ async def download_video(req: DownloadRequest):
 
         if not file_path or not os.path.exists(file_path):
             logger.error("File not found after download")
+
             return DownloadResponse(
                 success=False,
                 error="File not found after download",
@@ -144,6 +161,7 @@ async def download_video(req: DownloadRequest):
 
     except subprocess.TimeoutExpired:
         logger.error("Download timed out")
+
         return DownloadResponse(
             success=False,
             error="Download timed out (120s limit exceeded)",
@@ -155,6 +173,7 @@ async def download_video(req: DownloadRequest):
 
     except Exception as e:
         logger.exception("Unexpected error")
+
         return DownloadResponse(
             success=False,
             error=str(e),
