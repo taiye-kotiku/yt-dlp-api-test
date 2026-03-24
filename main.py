@@ -18,9 +18,6 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_BASE = os.getenv("DOWNLOAD_BASE", "/downloads")
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
 
-COOKIES_PATH = os.path.join(BASE_DIR, "cookies.txt")
-
-
 # === MODELS ===
 class DownloadRequest(BaseModel):
     url: str
@@ -73,24 +70,26 @@ def run_ytdlp(url: str, platform: str, output_template: str) -> tuple:
         "--print", "after_move:filepath",
         "--no-warnings",
         "--restrict-filenames",
-        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "--add-header", "Accept-Language:en-US,en;q=0.9",
     ]
 
+    # === PLATFORM CONFIG ===
     if platform == "youtube":
-        logger.info(f"Using cookies: {COOKIES_PATH} | Exists: {os.path.exists(COOKIES_PATH)}")
         cmd += [
             "-f", "best[ext=mp4]/best",
-            "--cookies", COOKIES_PATH,
-            "--extractor-args", "youtube:player_client=android,web"
+            "--extractor-args", "youtube:player_client=android,web,ios",
+            "--user-agent", "com.google.android.youtube/17.31.35 (Linux; U; Android 11)",
+            "--geo-bypass",
+            "--no-check-certificates",
         ]
+
     elif platform == "twitter":
         cmd += [
-            "-f", "bv*+ba/b",
+            "-f", "best",
             "--extractor-args", "twitter:api=graphql"
         ]
+
     else:
-        cmd += ["-f", "bv*+ba/b"]
+        cmd += ["-f", "best"]
 
     cmd.append(url)
 
@@ -121,8 +120,7 @@ def run_ytdlp(url: str, platform: str, output_template: str) -> tuple:
 
 @app.post("/download", response_model=DownloadResponse)
 async def download_video(req: DownloadRequest):
-    """Original endpoint — returns JSON with file path"""
-    logger.info(f"Download request: {req.url} | platform={req.platform} | mode={req.deliveryMode}")
+    logger.info(f"Download request: {req.url} | platform={req.platform}")
 
     save_folder = get_save_path(req.platform)
     output_template = os.path.join(save_folder, "%(title)s.%(ext)s")
@@ -141,7 +139,6 @@ async def download_video(req: DownloadRequest):
 
     file_size = os.path.getsize(file_path)
     file_name = os.path.basename(file_path)
-    logger.info(f"Download success: {file_path} ({file_size} bytes)")
 
     return DownloadResponse(
         success=True,
@@ -158,7 +155,6 @@ async def download_video(req: DownloadRequest):
 
 @app.post("/download-stream")
 async def download_stream(req: DownloadRequest):
-    """New endpoint — downloads video and streams binary back to n8n for Telegram delivery"""
     logger.info(f"Stream request: {req.url} | platform={req.platform}")
 
     save_folder = get_save_path(req.platform)
@@ -170,7 +166,6 @@ async def download_stream(req: DownloadRequest):
         return JSONResponse(status_code=400, content={"success": False, "error": error})
 
     file_name = os.path.basename(file_path)
-    logger.info(f"Streaming: {file_path}")
 
     return FileResponse(
         path=file_path,
@@ -192,4 +187,4 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "yt-dlp-api"}
+    return {"status": "ok"}
