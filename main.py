@@ -4,7 +4,6 @@ from pydantic import BaseModel, validator
 from typing import Union
 import subprocess
 import os
-import base64
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -18,20 +17,8 @@ logger = logging.getLogger(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_BASE = os.getenv("DOWNLOAD_BASE", "/downloads")
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
-COOKIES_PATH = os.path.join(BASE_DIR, "cookies.txt")
 
-# === DECODE COOKIES FROM ENV VAR ON STARTUP ===
-COOKIES_B64 = os.getenv("YOUTUBE_COOKIES_B64")
-if COOKIES_B64:
-    try:
-        cookies_bytes = base64.b64decode(COOKIES_B64)
-        with open(COOKIES_PATH, "wb") as f:
-            f.write(cookies_bytes)
-        logger.info("✅ Cookies written from YOUTUBE_COOKIES_B64 environment variable")
-    except Exception as e:
-        logger.error(f"❌ Failed to decode cookies from env var: {e}")
-else:
-    logger.warning("⚠️ YOUTUBE_COOKIES_B64 not set — YouTube may fail without cookies")
+COOKIES_PATH = os.path.join(BASE_DIR, "cookies.txt")
 
 
 # === MODELS ===
@@ -81,7 +68,6 @@ def run_ytdlp(url: str, platform: str, output_template: str) -> tuple:
     cmd = [
         "yt-dlp",
         "--no-playlist",
-        "--merge-output-format", "mp4",
         "--max-filesize", f"{MAX_FILE_SIZE_MB}M",
         "--output", output_template,
         "--print", "after_move:filepath",
@@ -92,20 +78,12 @@ def run_ytdlp(url: str, platform: str, output_template: str) -> tuple:
     ]
 
     if platform == "youtube":
-        cookies_valid = os.path.exists(COOKIES_PATH) and os.path.getsize(COOKIES_PATH) > 100
-        if cookies_valid:
-            logger.info(f"Using cookies from: {COOKIES_PATH}")
-            cmd += [
-                "-f", "bv*+ba/b",
-                "--cookies", COOKIES_PATH,
-                "--extractor-args", "youtube:player_client=android,web"
-            ]
-        else:
-            logger.warning("Cookies missing or too small — attempting without cookies")
-            cmd += [
-                "-f", "bv*+ba/b",
-                "--extractor-args", "youtube:player_client=android,web"
-            ]
+        logger.info(f"Using cookies: {COOKIES_PATH} | Exists: {os.path.exists(COOKIES_PATH)}")
+        cmd += [
+            "-f", "best[ext=mp4]/best",
+            "--cookies", COOKIES_PATH,
+            "--extractor-args", "youtube:player_client=android,web"
+        ]
     elif platform == "twitter":
         cmd += [
             "-f", "bv*+ba/b",
@@ -180,7 +158,7 @@ async def download_video(req: DownloadRequest):
 
 @app.post("/download-stream")
 async def download_stream(req: DownloadRequest):
-    """Streams video binary back to n8n for direct Telegram delivery"""
+    """New endpoint — downloads video and streams binary back to n8n for Telegram delivery"""
     logger.info(f"Stream request: {req.url} | platform={req.platform}")
 
     save_folder = get_save_path(req.platform)
