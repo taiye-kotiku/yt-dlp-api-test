@@ -29,7 +29,7 @@ class DownloadRequest(BaseModel):
     chatId: Union[str, int]
     deliveryMode: str
 
-    @validator('chatId', pre=True)
+    @validator("chatId", pre=True)
     def coerce_chat_id(cls, v):
         return str(v)
 
@@ -50,7 +50,6 @@ class DownloadResponse(BaseModel):
 
 
 # === COOKIE MANAGEMENT ===
-
 COOKIE_ENV_MAP = {
     "twitter": [
         "TWITTER_COOKIES_1_B64",
@@ -61,6 +60,7 @@ COOKIE_ENV_MAP = {
         "YOUTUBE_COOKIES_1_B64",
         "YOUTUBE_COOKIES_2_B64",
         "YOUTUBE_COOKIES_3_B64",
+        "YOUTUBE_COOKIES_B64",  # backward compatibility
     ],
     "facebook": [
         "FACEBOOK_COOKIES_1_B64",
@@ -81,10 +81,6 @@ COOKIE_ENV_MAP = {
 
 
 def get_cookie_files(platform: str) -> List[str]:
-    """
-    Decode all available base64 cookie env vars for a platform
-    into temp files. Returns list of file paths.
-    """
     env_keys = COOKIE_ENV_MAP.get(platform, [])
     cookie_files = []
 
@@ -111,7 +107,6 @@ def get_cookie_files(platform: str) -> List[str]:
 
 
 def cleanup_cookie_files(cookie_files: List[str]):
-    """Remove temp cookie files after use."""
     for f in cookie_files:
         try:
             os.unlink(f)
@@ -120,7 +115,6 @@ def cleanup_cookie_files(cookie_files: List[str]):
 
 
 # === HELPERS ===
-
 def get_save_path(platform: str) -> str:
     date_str = datetime.now().strftime("%Y-%m-%d")
     folder = os.path.join(DOWNLOAD_BASE, platform, date_str)
@@ -129,32 +123,20 @@ def get_save_path(platform: str) -> str:
 
 
 def normalize_url(url: str, platform: str) -> str:
-    """Normalize URLs for known platform quirks."""
-
-    # YouTube Shorts → standard watch URL
     if platform == "youtube" and "youtube.com/shorts/" in url:
         video_id = url.split("/shorts/")[1].split("?")[0]
         return f"https://www.youtube.com/watch?v={video_id}"
 
-    # Facebook mobile → desktop
     if platform == "facebook" and "m.facebook.com" in url:
         url = url.replace("m.facebook.com", "www.facebook.com")
 
-    # Instagram reels/p normalization (strip tracking params)
-    if platform == "instagram":
-        if "?" in url:
-            url = url.split("?")[0]
-
-    # TikTok mobile share links stay as-is (yt-dlp handles redirects)
+    if platform == "instagram" and "?" in url:
+        url = url.split("?")[0]
 
     return url
 
 
 def detect_platform(url: str) -> str:
-    """
-    Auto-detect platform from URL.
-    Returns platform string or 'unknown'.
-    """
     url_lower = url.lower()
 
     if any(d in url_lower for d in ["twitter.com", "x.com", "t.co"]):
@@ -177,8 +159,6 @@ def build_ytdlp_cmd(
     output_template: str,
     cookie_file: Optional[str] = None,
 ) -> list:
-    """Build the yt-dlp command with platform-specific flags."""
-
     cmd = [
         "yt-dlp",
         "--no-playlist",
@@ -190,11 +170,8 @@ def build_ytdlp_cmd(
         "--no-overwrites",
     ]
 
-    # Cookie file (if available)
     if cookie_file:
         cmd += ["--cookies", cookie_file]
-
-    # === PLATFORM-SPECIFIC CONFIG ===
 
     if platform == "youtube":
         cmd += [
@@ -235,11 +212,53 @@ def build_ytdlp_cmd(
         ]
 
     else:
-        # Generic fallback — let yt-dlp figure it out
         cmd += ["-f", "best"]
 
     cmd.append(url)
     return cmd
+
+
+def classify_ytdlp_error(error_msg: str) -> str:
+    lower_error = error_msg.lower()
+
+    if "file is larger than max-filesize" in lower_error:
+        return "FILE_TOO_LARGE"
+    if "requested format is not available" in lower_error:
+        return "FORMAT_NOT_AVAILABLE"
+    if "http error 403" in lower_error:
+        return "AUTH_FAILED"
+    if "http error 404" in lower_error:
+        return "NOT_FOUND"
+    if "private video" in lower_error:
+        return "PRIVATE_VIDEO"
+    if "sign in to confirm your age" in lower_error:
+        return "AGE_RESTRICTED"
+    if "age-restricted" in lower_error:
+        return "AGE_RESTRICTED"
+    if "this video may be inappropriate for some users" in lower_error:
+        return "AGE_RESTRICTED"
+    if "login required" in lower_error:
+        return "AUTH_FAILED"
+    if "sign in to confirm you’re not a bot" in lower_error or "sign in to confirm you're not a bot" in lower_error:
+        return "AUTH_FAILED"
+    if "is not a valid url" in lower_error:
+        return "INVALID_URL"
+    if "unsupported url" in lower_error:
+        return "INVALID_URL"
+
+    return error_msg
+
+
+def extract_file_path(stdout: str) -> Optional[str]:
+    stdout_lines = [line.strip() for line in stdout.strip().split("\n") if line.strip()]
+    if not stdout_lines:
+        return None
+    return stdout_lines[-1]
+
+
+def run_subprocess(cmd: list, timeout: int = 120):
+    logger.info(f"Running yt-dlp command: {' '.join(cmd)}")
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
 def run_ytdlp_single(
@@ -248,45 +267,53 @@ def run_ytdlp_single(
     output_template: str,
     cookie_file: Optional[str] = None,
 ) -> tuple:
-    """
-    Run yt-dlp once with a specific cookie file.
-    Returns (file_path, error_string).
-    """
     cmd = build_ytdlp_cmd(url, platform, output_template, cookie_file)
 
-    logger.info(f"Running: {' '.join(cmd[:6])}... (cookie={'yes' if cookie_file else 'no'})")
-
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = run_subprocess(cmd, timeout=120)
+
+        # YouTube fallback if primary format/client fails
+        if result.returncode != 0 and platform == "youtube":
+            logger.warning("Primary YouTube command failed, trying fallback command...")
+
+            fallback_cmd = [
+                "yt-dlp",
+                "--no-playlist",
+                "--max-filesize", f"{MAX_FILE_SIZE_MB}M",
+                "--output", output_template,
+                "--print", "after_move:filepath",
+                "--no-warnings",
+                "--restrict-filenames",
+                "--no-overwrites",
+            ]
+
+            if cookie_file:
+                fallback_cmd += ["--cookies", cookie_file]
+
+            fallback_cmd += [
+                "-f", "best",
+                "--user-agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                url,
+            ]
+
+            result = run_subprocess(fallback_cmd, timeout=120)
 
         if result.returncode != 0:
-            error_msg = result.stderr.strip() or "Unknown yt-dlp error"
+            error_msg = result.stderr.strip() or result.stdout.strip() or "Unknown yt-dlp error"
+            logger.error(f"yt-dlp stderr: {result.stderr}")
+            logger.error(f"yt-dlp stdout: {result.stdout}")
+            return None, classify_ytdlp_error(error_msg)
 
-            # Check for specific error patterns
-            if "File is larger than max-filesize" in error_msg:
-                return None, "FILE_TOO_LARGE"
-            if "HTTP Error 403" in error_msg or "403" in error_msg:
-                return None, "AUTH_FAILED"
-            if "HTTP Error 404" in error_msg:
-                return None, "NOT_FOUND"
-            if "Private video" in error_msg:
-                return None, "PRIVATE_VIDEO"
-            if "Sign in to confirm" in error_msg or "age" in error_msg.lower():
-                return None, "AGE_RESTRICTED"
-            if "is not a valid URL" in error_msg:
-                return None, "INVALID_URL"
-
-            logger.error(f"yt-dlp failed: {error_msg}")
-            return None, error_msg
-
-        stdout_lines = result.stdout.strip().split("\n")
-        file_path = stdout_lines[-1] if stdout_lines else None
+        file_path = extract_file_path(result.stdout)
 
         if not file_path or not os.path.exists(file_path):
+            logger.error(f"Could not find downloaded file. stdout: {result.stdout}")
             return None, "File not found after download"
 
-        # Double-check file size (safety net)
         file_size = os.path.getsize(file_path)
+
         if file_size > MAX_FILE_SIZE_BYTES:
             os.remove(file_path)
             return None, "FILE_TOO_LARGE"
@@ -305,20 +332,15 @@ def run_ytdlp_single(
 
 
 def run_ytdlp(url: str, platform: str, output_template: str) -> tuple:
-    """
-    Run yt-dlp with cookie rotation.
-    Tries each cookie file in order, falls back to no cookies.
-    Returns (file_path, error_string, cookie_index_used).
-    """
     url = normalize_url(url, platform)
     cookie_files = get_cookie_files(platform)
 
-    # Non-retryable errors — don't waste cookies
     non_retryable = {
         "FILE_TOO_LARGE",
         "NOT_FOUND",
         "INVALID_URL",
         "TIMEOUT",
+        "FORMAT_NOT_AVAILABLE",
     }
 
     last_error = None
@@ -326,13 +348,10 @@ def run_ytdlp(url: str, platform: str, output_template: str) -> tuple:
     if cookie_files:
         for i, cookie_file in enumerate(cookie_files):
             logger.info(
-                f"Attempt {i + 1}/{len(cookie_files)} for {platform} "
-                f"with cookie file {i + 1}"
+                f"Attempt {i + 1}/{len(cookie_files)} for {platform} with cookie file {i + 1}"
             )
 
-            file_path, error = run_ytdlp_single(
-                url, platform, output_template, cookie_file
-            )
+            file_path, error = run_ytdlp_single(url, platform, output_template, cookie_file)
 
             if file_path:
                 logger.info(f"Success with cookie {i + 1}")
@@ -342,17 +361,14 @@ def run_ytdlp(url: str, platform: str, output_template: str) -> tuple:
             last_error = error
             logger.warning(f"Cookie {i + 1} failed: {error}")
 
-            # Don't rotate on non-retryable errors
             if error in non_retryable:
                 logger.info(f"Non-retryable error '{error}', stopping rotation")
                 cleanup_cookie_files(cookie_files)
                 return None, error, i + 1
 
-        # All cookies exhausted — try without cookies as last resort
         logger.info("All cookies failed, trying without cookies...")
         cleanup_cookie_files(cookie_files)
 
-    # No cookies available OR all cookies failed → try without
     file_path, error = run_ytdlp_single(url, platform, output_template, None)
 
     if file_path:
@@ -363,25 +379,20 @@ def run_ytdlp(url: str, platform: str, output_template: str) -> tuple:
 
 
 # === ERROR MESSAGES ===
-
 ERROR_MESSAGES = {
     "FILE_TOO_LARGE": (
         f"Video exceeds {MAX_FILE_SIZE_MB}MB Telegram limit. "
         f"Try a shorter video or use 'Save to Folder' mode."
     ),
     "AUTH_FAILED": (
-        "Authentication failed. The video may require login "
-        "or cookies have expired."
+        "Authentication failed. The video may require login or cookies have expired."
     ),
     "NOT_FOUND": "Video not found. The link may be broken or deleted.",
-    "PRIVATE_VIDEO": (
-        "This video is private. I can't access it even with cookies."
-    ),
-    "AGE_RESTRICTED": (
-        "This video is age-restricted and requires valid login cookies."
-    ),
+    "PRIVATE_VIDEO": "This video is private. I can't access it without valid cookies.",
+    "AGE_RESTRICTED": "This video is age-restricted and requires valid login cookies.",
     "INVALID_URL": "This doesn't look like a valid video URL.",
     "TIMEOUT": "Download timed out (120s). The video may be too long.",
+    "FORMAT_NOT_AVAILABLE": "No compatible downloadable format was found for this video.",
 }
 
 
@@ -390,7 +401,6 @@ def get_error_message(error_code: str) -> str:
 
 
 # === ROUTES ===
-
 @app.post("/download", response_model=DownloadResponse)
 async def download_video(req: DownloadRequest):
     platform = req.platform or detect_platform(req.url)
@@ -472,7 +482,6 @@ async def download_stream(req: DownloadRequest):
 
 @app.get("/health")
 async def health():
-    """Health check with cookie status."""
     cookie_status = {}
     for platform, keys in COOKIE_ENV_MAP.items():
         available = sum(1 for k in keys if os.getenv(k))
