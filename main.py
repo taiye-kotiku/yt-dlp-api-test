@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, validator
-from typing import Union, Optional, List
+from typing import Union, Optional, List, Tuple
 import subprocess
 import os
 import base64
@@ -60,7 +60,7 @@ COOKIE_ENV_MAP = {
         "YOUTUBE_COOKIES_1_B64",
         "YOUTUBE_COOKIES_2_B64",
         "YOUTUBE_COOKIES_3_B64",
-        "YOUTUBE_COOKIES_B64",  # backward compatibility
+        "YOUTUBE_COOKIES_B64",
     ],
     "facebook": [
         "FACEBOOK_COOKIES_1_B64",
@@ -84,10 +84,17 @@ def get_cookie_files(platform: str) -> List[str]:
     env_keys = COOKIE_ENV_MAP.get(platform, [])
     cookie_files = []
 
+    seen_values = set()
+
     for key in env_keys:
         b64_value = os.getenv(key)
         if not b64_value:
             continue
+
+        # Prevent duplicate loading if old + new env vars contain same value
+        if b64_value in seen_values:
+            continue
+        seen_values.add(b64_value)
 
         try:
             decoded = base64.b64decode(b64_value)
@@ -153,69 +160,11 @@ def detect_platform(url: str) -> str:
     return "unknown"
 
 
-def build_ytdlp_cmd(
-    url: str,
-    platform: str,
-    output_template: str,
-    cookie_file: Optional[str] = None,
-) -> list:
-    cmd = [
-        "yt-dlp",
-        "--no-playlist",
-        "--max-filesize", f"{MAX_FILE_SIZE_MB}M",
-        "--output", output_template,
-        "--print", "after_move:filepath",
-        "--no-warnings",
-        "--restrict-filenames",
-        "--no-overwrites",
-    ]
-
-    if cookie_file:
-        cmd += ["--cookies", cookie_file]
-
-    if platform == "youtube":
-        cmd += [
-            "-f", "best[ext=mp4]/best",
-            "--extractor-args", "youtube:player_client=android,web",
-            "--user-agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "--geo-bypass",
-            "--no-check-certificates",
-        ]
-
-    elif platform == "twitter":
-        cmd += [
-            "-f", "best",
-            "--extractor-args", "twitter:api=graphql",
-        ]
-
-    elif platform == "facebook":
-        cmd += [
-            "-f", "best[ext=mp4]/best",
-            "--no-check-certificates",
-        ]
-
-    elif platform == "instagram":
-        cmd += [
-            "-f", "best[ext=mp4]/best",
-            "--no-check-certificates",
-        ]
-
-    elif platform == "tiktok":
-        cmd += [
-            "-f", "best[ext=mp4]/best",
-            "--no-check-certificates",
-            "--user-agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        ]
-
-    else:
-        cmd += ["-f", "best"]
-
-    cmd.append(url)
-    return cmd
+def extract_file_path(stdout: str) -> Optional[str]:
+    stdout_lines = [line.strip() for line in stdout.strip().split("\n") if line.strip()]
+    if not stdout_lines:
+        return None
+    return stdout_lines[-1]
 
 
 def classify_ytdlp_error(error_msg: str) -> str:
@@ -245,20 +194,174 @@ def classify_ytdlp_error(error_msg: str) -> str:
         return "INVALID_URL"
     if "unsupported url" in lower_error:
         return "INVALID_URL"
+    if "unable to extract" in lower_error:
+        return "EXTRACTION_FAILED"
+    if "video unavailable" in lower_error:
+        return "NOT_FOUND"
 
     return error_msg
-
-
-def extract_file_path(stdout: str) -> Optional[str]:
-    stdout_lines = [line.strip() for line in stdout.strip().split("\n") if line.strip()]
-    if not stdout_lines:
-        return None
-    return stdout_lines[-1]
 
 
 def run_subprocess(cmd: list, timeout: int = 120):
     logger.info(f"Running yt-dlp command: {' '.join(cmd)}")
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def validate_downloaded_file(file_path: str) -> Tuple[Optional[str], Optional[str]]:
+    if not file_path or not os.path.exists(file_path):
+        return None, "File not found after download"
+
+    file_size = os.path.getsize(file_path)
+
+    if file_size > MAX_FILE_SIZE_BYTES:
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
+        return None, "FILE_TOO_LARGE"
+
+    if file_size == 0:
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
+        return None, "Downloaded file is empty"
+
+    return file_path, None
+
+
+def build_base_cmd(output_template: str, cookie_file: Optional[str] = None) -> list:
+    cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "--max-filesize", f"{MAX_FILE_SIZE_MB}M",
+        "--output", output_template,
+        "--print", "after_move:filepath",
+        "--no-warnings",
+        "--restrict-filenames",
+        "--no-overwrites",
+    ]
+
+    if cookie_file:
+        cmd += ["--cookies", cookie_file]
+
+    return cmd
+
+
+def build_strategy_commands(
+    url: str,
+    platform: str,
+    output_template: str,
+    cookie_file: Optional[str] = None,
+) -> List[list]:
+    base = build_base_cmd(output_template, cookie_file)
+
+    if platform == "youtube":
+        return [
+            base + [
+                "-f", "best[ext=mp4]/best",
+                "--extractor-args", "youtube:player_client=android,web",
+                "--user-agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "--geo-bypass",
+                "--no-check-certificates",
+                url,
+            ],
+            base + [
+                "-f", "best",
+                "--extractor-args", "youtube:player_client=web",
+                "--user-agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "--geo-bypass",
+                "--no-check-certificates",
+                url,
+            ],
+            base + [
+                "-f", "bv*[height<=720]+ba/b[height<=720]/b",
+                "--merge-output-format", "mp4",
+                "--extractor-args", "youtube:player_client=android,web",
+                "--user-agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "--geo-bypass",
+                "--no-check-certificates",
+                url,
+            ],
+            base + [
+                "-f", "b",
+                "--user-agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                url,
+            ],
+        ]
+
+    if platform == "twitter":
+        return [
+            base + [
+                "-f", "best",
+                "--extractor-args", "twitter:api=graphql",
+                url,
+            ],
+            base + [
+                "-f", "best",
+                url,
+            ],
+        ]
+
+    if platform == "facebook":
+        return [
+            base + [
+                "-f", "best[ext=mp4]/best",
+                "--no-check-certificates",
+                url,
+            ],
+            base + [
+                "-f", "best",
+                url,
+            ],
+        ]
+
+    if platform == "instagram":
+        return [
+            base + [
+                "-f", "best[ext=mp4]/best",
+                "--no-check-certificates",
+                url,
+            ],
+            base + [
+                "-f", "best",
+                url,
+            ],
+        ]
+
+    if platform == "tiktok":
+        return [
+            base + [
+                "-f", "best[ext=mp4]/best",
+                "--no-check-certificates",
+                "--user-agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                url,
+            ],
+            base + [
+                "-f", "best",
+                "--user-agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                url,
+            ],
+        ]
+
+    return [
+        base + [
+            "-f", "best",
+            url,
+        ]
+    ]
 
 
 def run_ytdlp_single(
@@ -267,68 +370,60 @@ def run_ytdlp_single(
     output_template: str,
     cookie_file: Optional[str] = None,
 ) -> tuple:
-    cmd = build_ytdlp_cmd(url, platform, output_template, cookie_file)
+    commands = build_strategy_commands(url, platform, output_template, cookie_file)
+    last_error = None
 
-    try:
-        result = run_subprocess(cmd, timeout=120)
+    for attempt_index, cmd in enumerate(commands, start=1):
+        try:
+            logger.info(
+                f"Strategy {attempt_index}/{len(commands)} for platform={platform} "
+                f"(cookie={'yes' if cookie_file else 'no'})"
+            )
 
-        # YouTube fallback if primary format/client fails
-        if result.returncode != 0 and platform == "youtube":
-            logger.warning("Primary YouTube command failed, trying fallback command...")
+            result = run_subprocess(cmd, timeout=120)
 
-            fallback_cmd = [
-                "yt-dlp",
-                "--no-playlist",
-                "--max-filesize", f"{MAX_FILE_SIZE_MB}M",
-                "--output", output_template,
-                "--print", "after_move:filepath",
-                "--no-warnings",
-                "--restrict-filenames",
-                "--no-overwrites",
-            ]
+            if result.returncode == 0:
+                file_path = extract_file_path(result.stdout)
+                validated_path, validation_error = validate_downloaded_file(file_path)
+                if validated_path:
+                    return validated_path, None
 
-            if cookie_file:
-                fallback_cmd += ["--cookies", cookie_file]
+                last_error = validation_error
+                logger.warning(f"Downloaded file failed validation: {validation_error}")
+                continue
 
-            fallback_cmd += [
-                "-f", "best",
-                "--user-agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                url,
-            ]
-
-            result = run_subprocess(fallback_cmd, timeout=120)
-
-        if result.returncode != 0:
             error_msg = result.stderr.strip() or result.stdout.strip() or "Unknown yt-dlp error"
+            classified = classify_ytdlp_error(error_msg)
+
             logger.error(f"yt-dlp stderr: {result.stderr}")
             logger.error(f"yt-dlp stdout: {result.stdout}")
-            return None, classify_ytdlp_error(error_msg)
+            logger.warning(f"Strategy {attempt_index} failed with: {classified}")
 
-        file_path = extract_file_path(result.stdout)
+            last_error = classified
 
-        if not file_path or not os.path.exists(file_path):
-            logger.error(f"Could not find downloaded file. stdout: {result.stdout}")
-            return None, "File not found after download"
+            # Stop trying more strategies for hard auth/content errors
+            if classified in {
+                "AGE_RESTRICTED",
+                "PRIVATE_VIDEO",
+                "AUTH_FAILED",
+                "NOT_FOUND",
+                "INVALID_URL",
+                "TIMEOUT",
+                "FILE_TOO_LARGE",
+            }:
+                return None, classified
 
-        file_size = os.path.getsize(file_path)
+            # Otherwise continue to next strategy
+            continue
 
-        if file_size > MAX_FILE_SIZE_BYTES:
-            os.remove(file_path)
-            return None, "FILE_TOO_LARGE"
+        except subprocess.TimeoutExpired:
+            logger.warning(f"Strategy {attempt_index} timed out")
+            return None, "TIMEOUT"
+        except Exception as e:
+            logger.exception("Unexpected error in run_ytdlp_single")
+            last_error = str(e)
 
-        if file_size == 0:
-            os.remove(file_path)
-            return None, "Downloaded file is empty"
-
-        return file_path, None
-
-    except subprocess.TimeoutExpired:
-        return None, "TIMEOUT"
-    except Exception as e:
-        logger.exception("Unexpected error in run_ytdlp_single")
-        return None, str(e)
+    return None, last_error or "All format strategies failed"
 
 
 def run_ytdlp(url: str, platform: str, output_template: str) -> tuple:
@@ -340,7 +435,6 @@ def run_ytdlp(url: str, platform: str, output_template: str) -> tuple:
         "NOT_FOUND",
         "INVALID_URL",
         "TIMEOUT",
-        "FORMAT_NOT_AVAILABLE",
     }
 
     last_error = None
@@ -387,12 +481,13 @@ ERROR_MESSAGES = {
     "AUTH_FAILED": (
         "Authentication failed. The video may require login or cookies have expired."
     ),
-    "NOT_FOUND": "Video not found. The link may be broken or deleted.",
+    "NOT_FOUND": "Video not found. The link may be broken, deleted, or unavailable.",
     "PRIVATE_VIDEO": "This video is private. I can't access it without valid cookies.",
     "AGE_RESTRICTED": "This video is age-restricted and requires valid login cookies.",
     "INVALID_URL": "This doesn't look like a valid video URL.",
     "TIMEOUT": "Download timed out (120s). The video may be too long.",
     "FORMAT_NOT_AVAILABLE": "No compatible downloadable format was found for this video.",
+    "EXTRACTION_FAILED": "Could not extract this video. The platform may be blocking access.",
 }
 
 
