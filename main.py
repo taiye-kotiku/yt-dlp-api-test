@@ -7,6 +7,7 @@ import os
 import base64
 import tempfile
 import logging
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -83,7 +84,6 @@ COOKIE_ENV_MAP = {
 def get_cookie_files(platform: str) -> List[str]:
     env_keys = COOKIE_ENV_MAP.get(platform, [])
     cookie_files = []
-
     seen_values = set()
 
     for key in env_keys:
@@ -91,7 +91,6 @@ def get_cookie_files(platform: str) -> List[str]:
         if not b64_value:
             continue
 
-        # Prevent duplicate loading if old + new env vars contain same value
         if b64_value in seen_values:
             continue
         seen_values.add(b64_value)
@@ -160,13 +159,6 @@ def detect_platform(url: str) -> str:
     return "unknown"
 
 
-def extract_file_path(stdout: str) -> Optional[str]:
-    stdout_lines = [line.strip() for line in stdout.strip().split("\n") if line.strip()]
-    if not stdout_lines:
-        return None
-    return stdout_lines[-1]
-
-
 def classify_ytdlp_error(error_msg: str) -> str:
     lower_error = error_msg.lower()
 
@@ -186,9 +178,9 @@ def classify_ytdlp_error(error_msg: str) -> str:
         return "AGE_RESTRICTED"
     if "this video may be inappropriate for some users" in lower_error:
         return "AGE_RESTRICTED"
-    if "login required" in lower_error:
-        return "AUTH_FAILED"
     if "sign in to confirm you’re not a bot" in lower_error or "sign in to confirm you're not a bot" in lower_error:
+        return "BOT_PROTECTION"
+    if "login required" in lower_error:
         return "AUTH_FAILED"
     if "is not a valid url" in lower_error:
         return "INVALID_URL"
@@ -205,6 +197,13 @@ def classify_ytdlp_error(error_msg: str) -> str:
 def run_subprocess(cmd: list, timeout: int = 120):
     logger.info(f"Running yt-dlp command: {' '.join(cmd)}")
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def extract_file_path(stdout: str) -> Optional[str]:
+    stdout_lines = [line.strip() for line in stdout.strip().split("\n") if line.strip()]
+    if not stdout_lines:
+        return None
+    return stdout_lines[-1]
 
 
 def validate_downloaded_file(file_path: str) -> Tuple[Optional[str], Optional[str]]:
@@ -241,11 +240,58 @@ def build_base_cmd(output_template: str, cookie_file: Optional[str] = None) -> l
         "--restrict-filenames",
         "--no-overwrites",
     ]
+    if cookie_file:
+        cmd += ["--cookies", cookie_file]
+    return cmd
 
+
+def build_probe_cmd(url: str, platform: str, cookie_file: Optional[str] = None) -> list:
+    cmd = [
+        "yt-dlp",
+        "--dump-single-json",
+        "--no-warnings",
+    ]
     if cookie_file:
         cmd += ["--cookies", cookie_file]
 
+    if platform == "youtube":
+        cmd += [
+            "--extractor-args", "youtube:player_client=android,web",
+            "--user-agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "--geo-bypass",
+            "--no-check-certificates",
+        ]
+
+    cmd.append(url)
     return cmd
+
+
+def probe_video(url: str, platform: str, cookie_file: Optional[str] = None) -> Tuple[Optional[dict], Optional[str]]:
+    try:
+        cmd = build_probe_cmd(url, platform, cookie_file)
+        result = run_subprocess(cmd, timeout=60)
+
+        if result.returncode != 0:
+            error_msg = result.stderr.strip() or result.stdout.strip() or "Probe failed"
+            logger.error(f"Probe stderr: {result.stderr}")
+            logger.error(f"Probe stdout: {result.stdout}")
+            return None, classify_ytdlp_error(error_msg)
+
+        try:
+            data = json.loads(result.stdout)
+            return data, None
+        except Exception as e:
+            logger.warning(f"Probe JSON parse failed: {e}")
+            logger.warning(f"Probe output: {result.stdout[:500]}")
+            return None, "EXTRACTION_FAILED"
+
+    except subprocess.TimeoutExpired:
+        return None, "TIMEOUT"
+    except Exception as e:
+        logger.exception("Unexpected probe error")
+        return None, str(e)
 
 
 def build_strategy_commands(
@@ -259,18 +305,8 @@ def build_strategy_commands(
     if platform == "youtube":
         return [
             base + [
-                "-f", "best[ext=mp4]/best",
-                "--extractor-args", "youtube:player_client=android,web",
-                "--user-agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "--geo-bypass",
-                "--no-check-certificates",
-                url,
-            ],
-            base + [
                 "-f", "best",
-                "--extractor-args", "youtube:player_client=web",
+                "--extractor-args", "youtube:player_client=android,web",
                 "--user-agent",
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -279,9 +315,8 @@ def build_strategy_commands(
                 url,
             ],
             base + [
-                "-f", "bv*[height<=720]+ba/b[height<=720]/b",
-                "--merge-output-format", "mp4",
-                "--extractor-args", "youtube:player_client=android,web",
+                "-f", "best[ext=mp4]/best",
+                "--extractor-args", "youtube:player_client=web",
                 "--user-agent",
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -296,45 +331,30 @@ def build_strategy_commands(
                 "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 url,
             ],
+            base + [
+                url,
+            ],
         ]
 
     if platform == "twitter":
         return [
-            base + [
-                "-f", "best",
-                "--extractor-args", "twitter:api=graphql",
-                url,
-            ],
-            base + [
-                "-f", "best",
-                url,
-            ],
+            base + ["-f", "best", "--extractor-args", "twitter:api=graphql", url],
+            base + ["-f", "best", url],
+            base + [url],
         ]
 
     if platform == "facebook":
         return [
-            base + [
-                "-f", "best[ext=mp4]/best",
-                "--no-check-certificates",
-                url,
-            ],
-            base + [
-                "-f", "best",
-                url,
-            ],
+            base + ["-f", "best[ext=mp4]/best", "--no-check-certificates", url],
+            base + ["-f", "best", url],
+            base + [url],
         ]
 
     if platform == "instagram":
         return [
-            base + [
-                "-f", "best[ext=mp4]/best",
-                "--no-check-certificates",
-                url,
-            ],
-            base + [
-                "-f", "best",
-                url,
-            ],
+            base + ["-f", "best[ext=mp4]/best", "--no-check-certificates", url],
+            base + ["-f", "best", url],
+            base + [url],
         ]
 
     if platform == "tiktok":
@@ -354,13 +374,12 @@ def build_strategy_commands(
                 "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 url,
             ],
+            base + [url],
         ]
 
     return [
-        base + [
-            "-f", "best",
-            url,
-        ]
+        base + ["-f", "best", url],
+        base + [url],
     ]
 
 
@@ -370,8 +389,28 @@ def run_ytdlp_single(
     output_template: str,
     cookie_file: Optional[str] = None,
 ) -> tuple:
+    probe_data, probe_error = probe_video(url, platform, cookie_file)
+
+    if probe_error:
+        logger.warning(f"Probe failed for {platform}: {probe_error}")
+        if probe_error in {
+            "AUTH_FAILED",
+            "BOT_PROTECTION",
+            "AGE_RESTRICTED",
+            "PRIVATE_VIDEO",
+            "NOT_FOUND",
+            "INVALID_URL",
+        }:
+            return None, probe_error
+
+    else:
+        logger.info(
+            f"Probe success: title={probe_data.get('title')} "
+            f"formats={len(probe_data.get('formats', []))}"
+        )
+
     commands = build_strategy_commands(url, platform, output_template, cookie_file)
-    last_error = None
+    last_error = probe_error
 
     for attempt_index, cmd in enumerate(commands, start=1):
         try:
@@ -401,11 +440,11 @@ def run_ytdlp_single(
 
             last_error = classified
 
-            # Stop trying more strategies for hard auth/content errors
             if classified in {
                 "AGE_RESTRICTED",
                 "PRIVATE_VIDEO",
                 "AUTH_FAILED",
+                "BOT_PROTECTION",
                 "NOT_FOUND",
                 "INVALID_URL",
                 "TIMEOUT",
@@ -413,7 +452,6 @@ def run_ytdlp_single(
             }:
                 return None, classified
 
-            # Otherwise continue to next strategy
             continue
 
         except subprocess.TimeoutExpired:
@@ -441,9 +479,7 @@ def run_ytdlp(url: str, platform: str, output_template: str) -> tuple:
 
     if cookie_files:
         for i, cookie_file in enumerate(cookie_files):
-            logger.info(
-                f"Attempt {i + 1}/{len(cookie_files)} for {platform} with cookie file {i + 1}"
-            )
+            logger.info(f"Attempt {i + 1}/{len(cookie_files)} for {platform} with cookie file {i + 1}")
 
             file_path, error = run_ytdlp_single(url, platform, output_template, cookie_file)
 
@@ -478,9 +514,8 @@ ERROR_MESSAGES = {
         f"Video exceeds {MAX_FILE_SIZE_MB}MB Telegram limit. "
         f"Try a shorter video or use 'Save to Folder' mode."
     ),
-    "AUTH_FAILED": (
-        "Authentication failed. The video may require login or cookies have expired."
-    ),
+    "AUTH_FAILED": "Authentication failed. The video may require login or cookies have expired.",
+    "BOT_PROTECTION": "YouTube blocked this request as suspicious. Fresh cookies are required.",
     "NOT_FOUND": "Video not found. The link may be broken, deleted, or unavailable.",
     "PRIVATE_VIDEO": "This video is private. I can't access it without valid cookies.",
     "AGE_RESTRICTED": "This video is age-restricted and requires valid login cookies.",
