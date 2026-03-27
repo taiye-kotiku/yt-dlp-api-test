@@ -198,13 +198,13 @@ def build_ytdlp_cmd(
 
     if platform == "youtube":
         cmd += [
-            "-f", "best[ext=mp4][filesize<50M]/best[ext=mp4]/best",
-            "--extractor-args", "youtube:player_client=android,web,ios",
+            "-f", "best[ext=mp4]/best",
+            "--extractor-args", "youtube:player_client=android,web",
             "--user-agent",
-            "com.google.android.youtube/17.31.35 (Linux; U; Android 11)",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "--geo-bypass",
             "--no-check-certificates",
-            "--age-limit", "99",
         ]
 
     elif platform == "twitter":
