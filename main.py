@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 # === CONFIG ===
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DOWNLOAD_BASE = os.getenv("DOWNLOAD_BASE", "/downloads")
+DOWNLOAD_BASE = os.getenv("DOWNLOAD_BASE", "/mnt/nas/video_downloader")
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 
@@ -77,6 +77,11 @@ COOKIE_ENV_MAP = {
         "TIKTOK_COOKIES_1_B64",
         "TIKTOK_COOKIES_2_B64",
         "TIKTOK_COOKIES_3_B64",
+    ],
+    "reddit": [
+        "REDDIT_COOKIES_1_B64",
+        "REDDIT_COOKIES_2_B64",
+        "REDDIT_COOKIES_3_B64",
     ],
 }
 
@@ -155,6 +160,8 @@ def detect_platform(url: str) -> str:
         return "instagram"
     elif any(d in url_lower for d in ["tiktok.com", "vm.tiktok.com"]):
         return "tiktok"
+    elif any(d in url_lower for d in ["reddit.com", "redd.it", "old.reddit.com"]):
+        return "reddit"
 
     return "unknown"
 
@@ -190,6 +197,8 @@ def classify_ytdlp_error(error_msg: str) -> str:
         return "EXTRACTION_FAILED"
     if "video unavailable" in lower_error:
         return "NOT_FOUND"
+    if "forbidden" in lower_error:
+        return "AUTH_FAILED"
 
     return error_msg
 
@@ -263,6 +272,12 @@ def build_probe_cmd(url: str, platform: str, cookie_file: Optional[str] = None) 
             "--geo-bypass",
             "--no-check-certificates",
         ]
+    elif platform == "reddit":
+        cmd += [
+            "--user-agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        ]
 
     cmd.append(url)
     return cmd
@@ -331,9 +346,7 @@ def build_strategy_commands(
                 "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 url,
             ],
-            base + [
-                url,
-            ],
+            base + [url],
         ]
 
     if platform == "twitter":
@@ -377,6 +390,26 @@ def build_strategy_commands(
             base + [url],
         ]
 
+    if platform == "reddit":
+        return [
+            base + [
+                "-f", "bestvideo+bestaudio/best",
+                "--merge-output-format", "mp4",
+                "--user-agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                url,
+            ],
+            base + [
+                "-f", "best",
+                "--user-agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                url,
+            ],
+            base + [url],
+        ]
+
     return [
         base + ["-f", "best", url],
         base + [url],
@@ -402,7 +435,6 @@ def run_ytdlp_single(
             "INVALID_URL",
         }:
             return None, probe_error
-
     else:
         logger.info(
             f"Probe success: title={probe_data.get('title')} "
@@ -515,7 +547,7 @@ ERROR_MESSAGES = {
         f"Try a shorter video or use 'Save to Folder' mode."
     ),
     "AUTH_FAILED": "Authentication failed. The video may require login or cookies have expired.",
-    "BOT_PROTECTION": "YouTube blocked this request as suspicious. Fresh cookies are required.",
+    "BOT_PROTECTION": "The platform blocked this request as suspicious. Fresh cookies are required.",
     "NOT_FOUND": "Video not found. The link may be broken, deleted, or unavailable.",
     "PRIVATE_VIDEO": "This video is private. I can't access it without valid cookies.",
     "AGE_RESTRICTED": "This video is age-restricted and requires valid login cookies.",
@@ -619,6 +651,7 @@ async def health():
 
     return {
         "status": "ok",
+        "downloadBase": DOWNLOAD_BASE,
         "maxFileSizeMB": MAX_FILE_SIZE_MB,
         "cookies": cookie_status,
         "supportedPlatforms": list(COOKIE_ENV_MAP.keys()),
@@ -629,5 +662,5 @@ async def health():
 async def root():
     return {
         "message": "yt-dlp API is running",
-        "platforms": ["twitter", "youtube", "facebook", "instagram", "tiktok"],
+        "platforms": ["twitter", "youtube", "facebook", "instagram", "tiktok", "reddit"],
     }
