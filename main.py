@@ -83,6 +83,7 @@ COOKIE_ENV_MAP = {
         "REDDIT_COOKIES_2_B64",
         "REDDIT_COOKIES_3_B64",
     ],
+    "direct": []
 }
 
 
@@ -147,6 +148,11 @@ def normalize_url(url: str, platform: str) -> str:
     return url
 
 
+def is_direct_video_url(url: str) -> bool:
+    base = url.lower().split("?")[0]
+    return any(base.endswith(ext) for ext in [".mp4", ".mov", ".webm", ".m4v", ".m3u8"])
+
+
 def detect_platform(url: str) -> str:
     url_lower = url.lower()
 
@@ -162,6 +168,12 @@ def detect_platform(url: str) -> str:
         return "tiktok"
     elif any(d in url_lower for d in ["reddit.com", "redd.it", "old.reddit.com"]):
         return "reddit"
+    elif any(d in url_lower for d in [
+        "cdn.videy.co",
+        "hoesfree.online",
+        "github.io"
+    ]) or is_direct_video_url(url_lower):
+        return "direct"
 
     return "unknown"
 
@@ -272,7 +284,7 @@ def build_probe_cmd(url: str, platform: str, cookie_file: Optional[str] = None) 
             "--geo-bypass",
             "--no-check-certificates",
         ]
-    elif platform == "reddit":
+    elif platform in ["reddit", "direct"]:
         cmd += [
             "--user-agent",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -402,6 +414,24 @@ def build_strategy_commands(
             ],
             base + [
                 "-f", "best",
+                "--user-agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                url,
+            ],
+            base + [url],
+        ]
+
+    if platform == "direct":
+        return [
+            base + [
+                "-f", "best",
+                "--user-agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                url,
+            ],
+            base + [
                 "--user-agent",
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -662,5 +692,5 @@ async def health():
 async def root():
     return {
         "message": "yt-dlp API is running",
-        "platforms": ["twitter", "youtube", "facebook", "instagram", "tiktok", "reddit"],
+        "platforms": ["twitter", "youtube", "facebook", "instagram", "tiktok", "reddit", "direct"],
     }
