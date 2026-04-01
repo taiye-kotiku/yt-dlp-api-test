@@ -8,8 +8,12 @@ import base64
 import tempfile
 import logging
 import json
+import re
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urljoin
+
+import requests
 
 app = FastAPI(title="yt-dlp API for n8n")
 
@@ -21,6 +25,13 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_BASE = os.getenv("DOWNLOAD_BASE", "/mnt/nas/video_downloader")
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
+}
 
 
 # === MODELS ===
@@ -83,7 +94,7 @@ COOKIE_ENV_MAP = {
         "REDDIT_COOKIES_2_B64",
         "REDDIT_COOKIES_3_B64",
     ],
-    "direct": []
+    "direct": [],
 }
 
 
@@ -227,6 +238,26 @@ def extract_file_path(stdout: str) -> Optional[str]:
     return stdout_lines[-1]
 
 
+def find_latest_media_file(folder: str) -> Optional[str]:
+    try:
+        p = Path(folder)
+        if not p.exists():
+            return None
+
+        candidates = []
+        for ext in ["*.mp4", "*.mov", "*.webm", "*.m4v", "*.mkv", "*.mp3", "*.m4a", "*.ts"]:
+            candidates.extend(list(p.glob(ext)))
+
+        if not candidates:
+            return None
+
+        latest = max(candidates, key=lambda x: x.stat().st_mtime)
+        return str(latest)
+    except Exception as e:
+        logger.warning(f"Failed scanning folder for downloaded files: {e}")
+        return None
+
+
 def validate_downloaded_file(file_path: str) -> Tuple[Optional[str], Optional[str]]:
     if not file_path or not os.path.exists(file_path):
         return None, "File not found after download"
@@ -278,17 +309,13 @@ def build_probe_cmd(url: str, platform: str, cookie_file: Optional[str] = None) 
     if platform == "youtube":
         cmd += [
             "--extractor-args", "youtube:player_client=android,web",
-            "--user-agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "--user-agent", REQUEST_HEADERS["User-Agent"],
             "--geo-bypass",
             "--no-check-certificates",
         ]
     elif platform in ["reddit", "direct"]:
         cmd += [
-            "--user-agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "--user-agent", REQUEST_HEADERS["User-Agent"],
         ]
 
     cmd.append(url)
@@ -321,6 +348,47 @@ def probe_video(url: str, platform: str, cookie_file: Optional[str] = None) -> T
         return None, str(e)
 
 
+def extract_direct_media_from_page(url: str) -> Optional[str]:
+    try:
+        logger.info(f"Trying HTML extraction fallback for wrapper URL: {url}")
+        r = requests.get(url, headers=REQUEST_HEADERS, timeout=20)
+        if r.status_code >= 400:
+            logger.warning(f"Wrapper fetch failed with status {r.status_code}")
+            return None
+
+        html = r.text
+
+        patterns = [
+            r'''<video[^>]+src=["']([^"']+)["']''',
+            r'''<source[^>]+src=["']([^"']+)["']''',
+            r'''["'](https?:\/\/[^"']+\.(?:mp4|m3u8|webm|mov|m4v)[^"']*)["']''',
+            r'''["'](\/[^"']+\.(?:mp4|m3u8|webm|mov|m4v)[^"']*)["']''',
+            r'''[?&]v=([^&]+\.mp4)''',
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, html, re.IGNORECASE)
+            if match:
+                candidate = match.group(1)
+                if not candidate.startswith("http"):
+                    candidate = urljoin(url, candidate)
+                logger.info(f"Extracted direct media URL from wrapper: {candidate}")
+                return candidate
+
+        parsed_v_param = re.search(r'[?&]v=([^&]+\.mp4)', url, re.IGNORECASE)
+        if parsed_v_param:
+            candidate = parsed_v_param.group(1)
+            if candidate.startswith("http"):
+                return candidate
+
+        logger.warning("No direct media source found in wrapper HTML")
+        return None
+
+    except Exception as e:
+        logger.warning(f"Wrapper extraction failed: {e}")
+        return None
+
+
 def build_strategy_commands(
     url: str,
     platform: str,
@@ -334,9 +402,7 @@ def build_strategy_commands(
             base + [
                 "-f", "best",
                 "--extractor-args", "youtube:player_client=android,web",
-                "--user-agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "--user-agent", REQUEST_HEADERS["User-Agent"],
                 "--geo-bypass",
                 "--no-check-certificates",
                 url,
@@ -344,18 +410,14 @@ def build_strategy_commands(
             base + [
                 "-f", "best[ext=mp4]/best",
                 "--extractor-args", "youtube:player_client=web",
-                "--user-agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "--user-agent", REQUEST_HEADERS["User-Agent"],
                 "--geo-bypass",
                 "--no-check-certificates",
                 url,
             ],
             base + [
                 "-f", "b",
-                "--user-agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "--user-agent", REQUEST_HEADERS["User-Agent"],
                 url,
             ],
             base + [url],
@@ -387,16 +449,12 @@ def build_strategy_commands(
             base + [
                 "-f", "best[ext=mp4]/best",
                 "--no-check-certificates",
-                "--user-agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "--user-agent", REQUEST_HEADERS["User-Agent"],
                 url,
             ],
             base + [
                 "-f", "best",
-                "--user-agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "--user-agent", REQUEST_HEADERS["User-Agent"],
                 url,
             ],
             base + [url],
@@ -407,16 +465,12 @@ def build_strategy_commands(
             base + [
                 "-f", "bestvideo+bestaudio/best",
                 "--merge-output-format", "mp4",
-                "--user-agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "--user-agent", REQUEST_HEADERS["User-Agent"],
                 url,
             ],
             base + [
                 "-f", "best",
-                "--user-agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "--user-agent", REQUEST_HEADERS["User-Agent"],
                 url,
             ],
             base + [url],
@@ -426,15 +480,11 @@ def build_strategy_commands(
         return [
             base + [
                 "-f", "best",
-                "--user-agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "--user-agent", REQUEST_HEADERS["User-Agent"],
                 url,
             ],
             base + [
-                "--user-agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "--user-agent", REQUEST_HEADERS["User-Agent"],
                 url,
             ],
             base + [url],
@@ -452,6 +502,14 @@ def run_ytdlp_single(
     output_template: str,
     cookie_file: Optional[str] = None,
 ) -> tuple:
+    original_url = url
+
+    if platform == "direct" and not is_direct_video_url(url):
+        extracted = extract_direct_media_from_page(url)
+        if extracted:
+            url = extracted
+            logger.info(f"Wrapper URL converted to direct media URL: {url}")
+
     probe_data, probe_error = probe_video(url, platform, cookie_file)
 
     if probe_error:
@@ -464,7 +522,21 @@ def run_ytdlp_single(
             "NOT_FOUND",
             "INVALID_URL",
         }:
-            return None, probe_error
+            if platform == "direct" and url == original_url:
+                extracted = extract_direct_media_from_page(original_url)
+                if extracted and extracted != original_url:
+                    logger.info("Retrying direct probe with extracted wrapper media URL")
+                    url = extracted
+                    probe_data, probe_error = probe_video(url, platform, cookie_file)
+                    if not probe_error:
+                        logger.info("Probe succeeded after wrapper extraction")
+                    else:
+                        logger.warning(f"Probe still failed after wrapper extraction: {probe_error}")
+                        return None, probe_error
+                else:
+                    return None, probe_error
+            else:
+                return None, probe_error
     else:
         logger.info(
             f"Probe success: title={probe_data.get('title')} "
@@ -473,6 +545,7 @@ def run_ytdlp_single(
 
     commands = build_strategy_commands(url, platform, output_template, cookie_file)
     last_error = probe_error
+    output_folder = str(Path(output_template).parent)
 
     for attempt_index, cmd in enumerate(commands, start=1):
         try:
@@ -485,6 +558,12 @@ def run_ytdlp_single(
 
             if result.returncode == 0:
                 file_path = extract_file_path(result.stdout)
+
+                # Fallback: if stdout doesn't return usable final path, scan folder
+                if not file_path or not os.path.exists(file_path):
+                    logger.warning("Stdout path missing or invalid, scanning folder for latest media file...")
+                    file_path = find_latest_media_file(output_folder)
+
                 validated_path, validation_error = validate_downloaded_file(file_path)
                 if validated_path:
                     return validated_path, None
